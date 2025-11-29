@@ -1,0 +1,8 @@
+torch>=2.0.0
+torchvision>=0.15.0
+opacus>=1.4.0
+matplotlib
+numpy
+web3>=6.0.0
+py-solc-x>=1.1.0
+requests

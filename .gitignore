@@ -1,1 +1,13 @@
-data/cifar-10-python.tar.gz
+# Foundry
+out/
+cache/
+lib/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
