@@ -145,7 +145,7 @@ class AdaptivePrivacyController:
         self.gradient_norms = []  # Store gradient norms for quantile calculation
         self.clipping_quantile = 0.75  # Use 75th percentile for clipping threshold
         self.min_clip_norm = 0.5  # Minimum clipping threshold
-        self.max_clip_norm = 5.0  # Maximum clipping threshold
+        self.max_clip_norm = 2.0  # Maximum clipping threshold (reduced from 5.0 to prevent instability)
         
         # Initialize Opacus
         self.privacy_engine = PrivacyEngine()
@@ -208,17 +208,21 @@ class AdaptivePrivacyController:
             # Use specified quantile
             new_clip_norm = quantile_value * 1.1  # 10% margin above quantile
         
-        # Bound the clipping threshold
+        # Bound the clipping threshold more aggressively
         new_clip_norm = max(self.min_clip_norm, min(self.max_clip_norm, new_clip_norm))
         
         # Smooth update: use exponential moving average to avoid sudden changes
-        alpha = 0.3  # Smoothing factor
+        # Use stronger smoothing (lower alpha) to prevent rapid growth
+        alpha = 0.2  # Reduced from 0.3 for more conservative updates
         self.max_grad_norm = alpha * new_clip_norm + (1 - alpha) * self.max_grad_norm
+        
+        # Additional safety: ensure we don't exceed max_clip_norm after smoothing
+        self.max_grad_norm = min(self.max_grad_norm, self.max_clip_norm)
         
         # Clear collected norms for next round
         self.gradient_norms = []
     
-    def adapt_parameters(self, val_loss):
+    def adapt_parameters(self, val_loss, debug=False, round_num=None):
         """
         Adaptive Privacy Mechanism - Closed-Loop Controller (Monitor-Decide-Act pattern)
         
@@ -234,6 +238,8 @@ class AdaptivePrivacyController:
         
         Args:
             val_loss: Validation loss Lt after local training epoch
+            debug: If True, print debugging information
+            round_num: Round number for debugging
             
         Returns:
             (noise_multiplier, max_grad_norm): Updated privacy parameters for next round
@@ -241,37 +247,65 @@ class AdaptivePrivacyController:
         if self.strategy == 'static':
             return self.noise_multiplier, self.max_grad_norm
 
+        # Store old values for debugging
+        old_noise_mult = self.noise_multiplier
+        old_clip_norm = self.max_grad_norm
+        old_prev_loss = self.prev_loss
+
         # --- ADAPTIVE LOGIC ---
         # 1. Adaptive Clipping (based on gradient norm quantiles):
-        # First adapt clipping threshold based on observed gradient norms
-        self.adapt_clipping_threshold()
-
+        # Only adapt clipping if we have gradient norms collected (i.e., for LDP)
+        # For CDP, gradient norms are not collected, so clipping stays at default
+        if len(self.gradient_norms) > 0:
+            self.adapt_clipping_threshold()
+        # For CDP: Keep clipping threshold at 1.0 (default) to maintain consistent noise scale
+        
         # 2. Noise Adaptation (Decide step):
         # Calculate scaling factor αt based on loss trend
         # If Lt < Lt-1 (learning is progressing), reduce σ by decay factor γ = 0.98
         # BUT: Only reduce if improvement is significant to avoid premature noise reduction
         loss_improvement = (self.prev_loss - val_loss) / self.prev_loss if self.prev_loss > 0 else 0
         
-        if val_loss < self.prev_loss and loss_improvement > 0.01:  # Require at least 1% improvement
-            # Improvement detected: Reduce noise multiplier by decay factor γ = 0.98
-            # This allows fine-tuning with less noise, spending privacy budget efficiently
-            # Use slower decay to avoid reducing noise too aggressively
-            self.noise_multiplier = max(0.5, self.noise_multiplier * 0.99)  # Slower decay: 0.99 instead of 0.98
+        # More conservative thresholds: require larger improvements before reducing noise
+        if val_loss < self.prev_loss and loss_improvement > 0.02:  # Increased from 0.005 to 0.02 (2% improvement required)
+            # Significant improvement detected: Reduce noise multiplier slowly
+            # Use very slow decay to avoid reducing noise too aggressively
+            self.noise_multiplier = max(0.7, self.noise_multiplier * 0.995)  # Changed to 0.995 for very slow decay, min 0.7
             self.patience_counter = 0
-        elif val_loss < self.prev_loss:
-            # Small improvement: Keep noise level (don't reduce yet)
+            action = "REDUCE_NOISE"
+        elif val_loss < self.prev_loss and loss_improvement > 0.01:  # Moderate improvement: keep noise
+            # Moderate improvement: Keep noise level (don't reduce yet)
             self.noise_multiplier = self.noise_multiplier
             self.patience_counter = 0
+            action = "KEEP_NOISE"
+        elif val_loss < self.prev_loss:
+            # Small improvement: Slightly reduce noise (very conservative)
+            self.noise_multiplier = max(0.7, self.noise_multiplier * 0.998)
+            self.patience_counter = 0
+            action = "SLIGHT_REDUCE"
         else:
             # Stagnation or increase: Increase noise to prevent overfitting/memorization
             # This conserves privacy budget when model is not learning effectively
-            self.noise_multiplier = min(2.0, self.noise_multiplier * 1.02)  # Slower increase: 1.02 instead of 1.05
+            self.noise_multiplier = min(1.5, self.noise_multiplier * 1.01)  # Slower increase, cap at 1.5
             self.patience_counter += 1
+            action = "INCREASE_NOISE"
 
         # 3. Loss-based Clipping Adjustment (fallback):
         # If gradients are exploding (loss spike), tighten the clip 
-        if val_loss > self.prev_loss * 1.1: 
+        # Only adjust if we're using adaptive clipping (LDP)
+        if len(self.gradient_norms) > 0 and val_loss > self.prev_loss * 1.1: 
              self.max_grad_norm = max(self.min_clip_norm, self.max_grad_norm * 0.9)
+             clip_action = "DECREASE_CLIP"
+        else:
+             clip_action = "KEEP_CLIP"
+        
+        # Debug output
+        if debug:
+            print(f"   [DEBUG Round {round_num}] Adaptive Parameters:")
+            print(f"      Validation Loss: {val_loss:.4f} (prev: {old_prev_loss:.4f}, improvement: {loss_improvement*100:.2f}%)")
+            print(f"      Noise Multiplier: {old_noise_mult:.4f} → {self.noise_multiplier:.4f} ({action})")
+            print(f"      Clip Norm: {old_clip_norm:.4f} → {self.max_grad_norm:.4f} ({clip_action})")
+            print(f"      Patience Counter: {self.patience_counter}")
         
         # Update previous loss for next comparison (Monitor step)
         self.prev_loss = val_loss
@@ -353,4 +387,5 @@ class AdaptivePrivacyController:
             steps=num_steps
         )
         
+        return temp_accountant.get_epsilon(delta=delta)
         return temp_accountant.get_epsilon(delta=delta)

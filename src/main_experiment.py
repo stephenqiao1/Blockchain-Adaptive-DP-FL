@@ -132,20 +132,20 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
                     loss.backward()
                     
                     # Collect gradient norms for adaptive clipping
-                    # For CDP: collect before clipping (raw gradients)
-                    # For LDP: collect after Opacus clipping (still useful for adaptation)
-                    if controller.strategy == 'adaptive':
-                        if decentralized:
-                            # For LDP: Opacus has already clipped, but we can still collect norms
-                            # from the wrapped model for adaptation purposes
-                            controller.collect_gradient_norm(client_model._module if hasattr(client_model, '_module') else client_model)
-                        else:
-                            # For CDP: collect raw gradient norms before clipping
-                            controller.collect_gradient_norm(client_model)
+                    # IMPORTANT: Only collect for LDP (decentralized) - CDP doesn't use adaptive clipping
+                    # because clients train without noise, so gradient norms are not meaningful for CDP
+                    if controller.strategy == 'adaptive' and decentralized:
+                        # For LDP: Opacus has already clipped, but we can still collect norms
+                        # from the wrapped model for adaptation purposes
+                        controller.collect_gradient_norm(client_model._module if hasattr(client_model, '_module') else client_model)
+                    # For CDP: Don't collect gradient norms - adaptive clipping not used in CDP
                     
                     # Clip gradients for CDP (if not using Opacus)
+                    # For CDP, use fixed clipping threshold (1.0) regardless of adaptive strategy
+                    # Adaptive clipping is only for LDP where clients add noise locally
                     if not decentralized:
-                        torch.nn.utils.clip_grad_norm_(client_model.parameters(), controller.max_grad_norm)
+                        clip_threshold = 1.0  # Fixed for CDP to maintain consistent noise scale
+                        torch.nn.utils.clip_grad_norm_(client_model.parameters(), clip_threshold)
                     
                     optimizer.step()
                     epoch_loss += loss.item()
@@ -180,7 +180,7 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
                     
                     # Adapt privacy parameters based on validation loss (Monitor-Decide-Act pattern)
                     # This implements the "Decide" and "Act" steps of the closed-loop controller
-                    controller.adapt_parameters(val_loss)
+                    controller.adapt_parameters(val_loss, debug=True, round_num=r+1)
             
             # Track epsilon for this round using RDP accountant
             if decentralized:
@@ -286,7 +286,9 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
                 # KEY DIFFERENCE: In CDP, noise is added ONCE at server with scale O(1)
                 # In LDP, each client adds noise independently, leading to O(√K) scaling
                 avg_noise_mult = np.mean([c.noise_multiplier for c in controllers])
-                avg_clip_norm = np.mean([c.max_grad_norm for c in controllers])
+                # For CDP, use fixed clipping norm (1.0) regardless of adaptive strategy
+                # Adaptive clipping only affects LDP, not CDP
+                avg_clip_norm = 1.0  # Fixed for CDP to maintain consistent noise scale
                 learning_rate = 0.01  # Match the optimizer LR
                 
                 # CDP: Server adds noise to aggregated gradients
@@ -294,6 +296,15 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
                 # Since weight_update ≈ lr * gradient, noise on weights ≈ lr * noise_on_gradients
                 cdp_noise_mult = avg_noise_mult / np.sqrt(NUM_CLIENTS)  # More efficient
                 cdp_noise_scale = learning_rate * cdp_noise_mult * avg_clip_norm
+                
+                # Debug output for CDP noise
+                if controllers[0].strategy == 'adaptive':
+                    print(f"   [DEBUG Round {r+1}] CDP Noise Application:")
+                    print(f"      Avg Client Noise Mult: {avg_noise_mult:.4f}")
+                    print(f"      CDP Noise Mult (reduced): {cdp_noise_mult:.4f} (÷√{NUM_CLIENTS})")
+                    print(f"      Avg Clip Norm: {avg_clip_norm:.4f}")
+                    print(f"      CDP Noise Scale: {cdp_noise_scale:.6f}")
+                    print(f"      Static CDP Noise Mult (for comparison): {1.0/np.sqrt(NUM_CLIENTS):.4f}")
                 
                 # Add Gaussian noise to weight updates (not absolute weights)
                 # This properly simulates adding noise to gradients before weight update
@@ -337,8 +348,22 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
                         # Standard Gaussian mechanism: epsilon = sqrt(2*ln(1.25/delta)) / sigma
                         # This is the standard formula for (epsilon, delta)-DP with Gaussian noise
                         # More accurate than simplified 1/(2*sigma^2) for finite delta
+                        #
+                        # IMPORTANT: This is an INVERSE relationship:
+                        #   - Lower noise (sigma) → Higher epsilon (more privacy cost)
+                        #   - Higher noise (sigma) → Lower epsilon (less privacy cost)
+                        # This is the fundamental privacy-utility trade-off in DP.
+                        # When adaptive reduces noise to improve accuracy, epsilon naturally increases.
                         cdp_epsilon = np.sqrt(2.0 * np.log(1.25 / TARGET_DELTA)) / cdp_noise_mult
                         # This gives reasonable epsilon values for single aggregation step
+                        
+                        # Debug output
+                        if controllers[0].strategy == 'adaptive':
+                            static_cdp_noise = 1.0 / np.sqrt(NUM_CLIENTS)
+                            static_cdp_epsilon = np.sqrt(2.0 * np.log(1.25 / TARGET_DELTA)) / static_cdp_noise
+                            epsilon_diff = cdp_epsilon - static_cdp_epsilon
+                            print(f"      Epsilon: {cdp_epsilon:.4f} (Static: {static_cdp_epsilon:.4f}, +{epsilon_diff:.4f})")
+                            print(f"      Note: Lower noise → Higher epsilon (privacy-utility trade-off)")
                     else:
                         cdp_epsilon = 0.01
                     
@@ -372,6 +397,12 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
         history['epsilon'].append(cumulative_epsilon)  # Store cumulative epsilon
         mode_str = "CDP" if not decentralized else "LDP"
         print(f"   >>> Round {r+1} Accuracy: {acc:.2f}% | Epsilon ({mode_str}): {cumulative_epsilon:.4f} (cumulative, +{round_epsilon:.4f} this round)")
+        
+        # Additional debug summary for adaptive centralized
+        if not decentralized and controllers[0].strategy == 'adaptive':
+            static_noise = 1.0 / np.sqrt(NUM_CLIENTS)
+            adaptive_noise = np.mean([c.noise_multiplier for c in controllers]) / np.sqrt(NUM_CLIENTS)
+            print(f"   [DEBUG Summary] Noise Comparison: Static={static_noise:.4f}, Adaptive={adaptive_noise:.4f} (ratio: {adaptive_noise/static_noise:.4f}x)")
 
     # Get cost analysis if decentralized
     cost_analysis = None
