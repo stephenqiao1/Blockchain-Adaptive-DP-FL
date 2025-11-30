@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from opacus import PrivacyEngine
 import os
+import time
 
 # Custom Modules
 from models import SimpleCNN, get_cifar10_loaders
@@ -18,6 +19,7 @@ ROUNDS = 5
 LOCAL_EPOCHS = 1
 TARGET_DELTA = 1e-5
 DEVICE = torch.device("cpu")
+CONVERGENCE_THRESHOLD = 40.0  # Accuracy threshold for convergence (e.g., 60%)
 
 def run_experiment(experiment_name, privacy_strategy, decentralized=True):
     """
@@ -71,11 +73,13 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
         ) for loader in client_loaders
     ]
 
-    history = {'accuracy': [], 'epsilon': []}
+    history = {'accuracy': [], 'epsilon': [], 'round_latency': []}
     cumulative_epsilon = 0.0  # Track cumulative privacy budget
+    convergence_round = None  # Track when convergence threshold is reached
 
     for r in range(ROUNDS):
         print(f"\n--- Round {r+1}/{ROUNDS} ---")
+        round_start_time = time.time()  # Start timing the round
         round_epsilons = []
         local_weights = []  # For centralized mode
         round_cids = []      # For decentralized mode
@@ -239,6 +243,7 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
                 local_weights.append(clean_state_dict)
 
         # --- PHASE 2: AGGREGATION ---
+        round_latency = 0.0  # Initialize latency (will be set after aggregation)
         if decentralized:
             # Decentralized: Download from IPFS
             print("   [Aggregator] Downloading models from IPFS...")
@@ -261,6 +266,10 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
                 # Upload global model to IPFS and record on blockchain
                 global_cid = ipfs.upload_model(global_model.state_dict(), f"global_round_{r}.pth")
                 chain.end_round(global_cid)
+                
+                # Round latency: time from round start to global model availability
+                round_end_time = time.time()
+                round_latency = round_end_time - round_start_time
                 
                 # Cleanup
                 ipfs.clear_temp_files()
@@ -322,6 +331,10 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
                 
                 global_model.load_state_dict(current_global)
                 
+                # Round latency: time from round start to global model availability
+                round_end_time = time.time()
+                round_latency = round_end_time - round_start_time
+                
                 # Compute epsilon for CDP
                 # In CDP, we use noise_multiplier / sqrt(K) which gives same privacy as LDP
                 # but with better accuracy. For epsilon, we approximate based on the noise scale.
@@ -370,6 +383,11 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
                     round_epsilons = [cdp_epsilon]
                 else:
                     round_epsilons = [0.0]
+                
+                # If no aggregation happened (no local weights), measure latency anyway
+                if round_latency == 0.0:
+                    round_end_time = time.time()
+                    round_latency = round_end_time - round_start_time
 
         # --- PHASE 3: EVALUATION ---
         acc = evaluate(global_model, test_loader)
@@ -395,8 +413,15 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
         
         history['accuracy'].append(acc)
         history['epsilon'].append(cumulative_epsilon)  # Store cumulative epsilon
+        history['round_latency'].append(round_latency)  # Store round latency
+        
+        # Check for convergence (first round where accuracy exceeds threshold)
+        if convergence_round is None and acc >= CONVERGENCE_THRESHOLD:
+            convergence_round = r + 1  # Round numbers are 1-indexed
+            print(f"   🎯 CONVERGED! Reached {CONVERGENCE_THRESHOLD}% accuracy at Round {convergence_round}")
+        
         mode_str = "CDP" if not decentralized else "LDP"
-        print(f"   >>> Round {r+1} Accuracy: {acc:.2f}% | Epsilon ({mode_str}): {cumulative_epsilon:.4f} (cumulative, +{round_epsilon:.4f} this round)")
+        print(f"   >>> Round {r+1} Accuracy: {acc:.2f}% | Epsilon ({mode_str}): {cumulative_epsilon:.4f} (cumulative, +{round_epsilon:.4f} this round) | Latency: {round_latency:.2f}s")
         
         # Additional debug summary for adaptive centralized
         if not decentralized and controllers[0].strategy == 'adaptive':
@@ -408,6 +433,10 @@ def run_experiment(experiment_name, privacy_strategy, decentralized=True):
     cost_analysis = None
     if decentralized and chain:
         cost_analysis = chain.get_cost_analysis()
+    
+    # Add convergence information to history
+    history['convergence_round'] = convergence_round
+    history['converged'] = convergence_round is not None
 
     return history, cost_analysis
 
@@ -431,7 +460,7 @@ def plot_comparison(results_dict):
         results_dict: Dictionary with keys like 'Centralized_Static', 'Centralized_Adaptive', etc.
                       Values are history dictionaries with 'accuracy' and 'epsilon' lists
     """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
     
     rounds = list(range(1, ROUNDS + 1))
     colors = {
@@ -467,6 +496,21 @@ def plot_comparison(results_dict):
                     label=label,
                     linewidth=2,
                     markersize=8)
+            
+            # Mark convergence point if reached
+            conv_round = history.get('convergence_round', None)
+            if conv_round is not None and conv_round <= len(accuracies):
+                conv_acc = accuracies[conv_round - 1]  # Round is 1-indexed
+                ax1.plot(conv_round, conv_acc, 
+                        color=colors.get(key, 'black'),
+                        marker='*', 
+                        markersize=15,
+                        markeredgecolor='yellow',
+                        markeredgewidth=2,
+                        zorder=10)
+    
+    # Add convergence threshold line
+    ax1.axhline(y=CONVERGENCE_THRESHOLD, color='red', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Convergence Threshold ({CONVERGENCE_THRESHOLD}%)')
     
     ax1.set_xlabel('Round', fontsize=12)
     ax1.set_ylabel('Accuracy (%)', fontsize=12)
@@ -495,6 +539,26 @@ def plot_comparison(results_dict):
     ax2.grid(True, alpha=0.3)
     ax2.set_xticks(rounds)
     
+    # Plot Round Latency (System Overhead)
+    for key, history in results_dict.items():
+        if history and 'round_latency' in history and len(history['round_latency']) > 0:
+            latencies = history['round_latency']
+            label = key.replace('_', ' ').title()
+            ax3.plot(rounds, latencies,
+                    color=colors.get(key, 'black'),
+                    linestyle=linestyles.get(key, '-'),
+                    marker=markers.get(key, 'o'),
+                    label=label,
+                    linewidth=2,
+                    markersize=8)
+    
+    ax3.set_xlabel('Round', fontsize=12)
+    ax3.set_ylabel('Latency (seconds)', fontsize=12)
+    ax3.set_title('Round Latency (System Overhead)', fontsize=14, fontweight='bold')
+    ax3.legend(loc='best', fontsize=10)
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xticks(rounds)
+    
     plt.tight_layout()
     
     # Save figure
@@ -506,14 +570,58 @@ def plot_comparison(results_dict):
     print("\n" + "="*80)
     print("SUMMARY TABLE")
     print("="*80)
-    print(f"{'Experiment':<30} {'Final Accuracy':<20} {'Final Epsilon':<20}")
+    print(f"{'Experiment':<30} {'Final Accuracy':<20} {'Final Epsilon':<20} {'Convergence':<20} {'Avg Latency':<20}")
     print("-"*80)
     for key, history in results_dict.items():
         if history and 'accuracy' in history and len(history['accuracy']) > 0:
             final_acc = history['accuracy'][-1]
             final_eps = history['epsilon'][-1] if 'epsilon' in history and len(history['epsilon']) > 0 else 0
+            conv_round = history.get('convergence_round', None)
+            if conv_round is not None:
+                conv_str = f"Round {conv_round}"
+            else:
+                conv_str = f"Not reached ({CONVERGENCE_THRESHOLD}%)"
+            avg_latency = np.mean(history['round_latency']) if 'round_latency' in history and len(history['round_latency']) > 0 else 0.0
             label = key.replace('_', ' ').title()
-            print(f"{label:<30} {final_acc:>18.2f}% {final_eps:>18.4f}")
+            print(f"{label:<30} {final_acc:>18.2f}% {final_eps:>18.4f} {conv_str:<20} {avg_latency:>18.2f}s")
+    print("="*80)
+    
+    # Convergence analysis section
+    print("\n" + "="*80)
+    print("CONVERGENCE ANALYSIS")
+    print("="*80)
+    print(f"Threshold: {CONVERGENCE_THRESHOLD}% accuracy")
+    print("-"*80)
+    print(f"{'Experiment':<30} {'Rounds to Convergence':<25} {'Status':<20}")
+    print("-"*80)
+    for key, history in results_dict.items():
+        if history:
+            conv_round = history.get('convergence_round', None)
+            label = key.replace('_', ' ').title()
+            if conv_round is not None:
+                print(f"{label:<30} {conv_round:<25} {'Converged':<20}")
+            else:
+                final_acc = history['accuracy'][-1] if 'accuracy' in history and len(history['accuracy']) > 0 else 0
+                print(f"{label:<30} {'N/A':<25} {f'Max: {final_acc:.2f}%':<20}")
+    print("="*80)
+    
+    # Round Latency Analysis section
+    print("\n" + "="*80)
+    print("ROUND LATENCY ANALYSIS (System Overhead)")
+    print("="*80)
+    print("Measures wall-clock time from round start to global model availability")
+    print("Includes: client training, blockchain/IPFS operations, aggregation")
+    print("-"*80)
+    print(f"{'Experiment':<30} {'Avg Latency (s)':<20} {'Total Time (s)':<20} {'Per-Round Breakdown':<30}")
+    print("-"*80)
+    for key, history in results_dict.items():
+        if history and 'round_latency' in history and len(history['round_latency']) > 0:
+            latencies = history['round_latency']
+            avg_latency = np.mean(latencies)
+            total_time = np.sum(latencies)
+            per_round = ', '.join([f"R{i+1}:{lat:.1f}s" for i, lat in enumerate(latencies)])
+            label = key.replace('_', ' ').title()
+            print(f"{label:<30} {avg_latency:>18.2f} {total_time:>18.2f} {per_round[:28]:<30}")
     print("="*80)
     
     plt.show()
