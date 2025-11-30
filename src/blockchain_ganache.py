@@ -24,6 +24,10 @@ class GanacheHandler:
         
         # 2. Compile & Deploy Contract
         self.contract = self._deploy_contract()
+        
+        # 3. Register aggregator as owner (already registered by default)
+        # Register all client accounts
+        self._register_clients()
 
     def _deploy_contract(self):
         print("🔨 Compiling Solidity Contract...")
@@ -61,38 +65,201 @@ class GanacheHandler:
             address=tx_receipt.contractAddress, 
             abi=contract_interface["abi"]
         )
+    
+    def _register_clients(self):
+        """Register all client accounts with the contract"""
+        print("Registering clients...")
+        registered_count = 0
+        for i in range(1, min(len(self.accounts), 10)):  # Register up to 9 clients
+            try:
+                client_account = self.accounts[i]
+                # Check if already registered
+                is_registered = self.contract.functions.clients(client_account).call()[0]
+                if not is_registered:
+                    # Use new registerClient() function
+                    try:
+                        tx_hash = self.contract.functions.registerClient().transact({
+                            'from': client_account
+                        })
+                    except:
+                        # Fallback to legacy register()
+                        tx_hash = self.contract.functions.register().transact({
+                            'from': client_account
+                        })
+                    self.w3.eth.wait_for_transaction_receipt(tx_hash)
+                    registered_count += 1
+            except Exception as e:
+                # If registration fails, continue (might already be registered)
+                pass
+        if registered_count > 0:
+            print(f"   Registered {registered_count} clients")
 
-    def submit_update(self, client_index, ipfs_hash_sim):
+    def submit_update(self, client_index, ipfs_hash_sim, epsilon_cost=None):
         """
-        Client submits a hash. We use different accounts for different clients
-        to simulate a real network.
+        Client submits a hash with epsilon cost tracking.
+        We use different accounts for different clients to simulate a real network.
+        
+        Args:
+            client_index: Index of the client
+            ipfs_hash_sim: IPFS hash (CID) of the model update
+            epsilon_cost: Privacy budget consumed (scaled by 1e18). If None, uses default 0.1
         """
         # Map client index to a Ganache account (wrapping around if needed)
         client_account = self.accounts[(client_index + 1) % len(self.accounts)]
         
-        tx_hash = self.contract.functions.submitUpdate(ipfs_hash_sim).transact({
-            'from': client_account
-        })
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
-        self.total_gas_used += receipt.gasUsed
-        self.current_round_gas += receipt.gasUsed
-        return receipt.gasUsed
+        # Convert string hash to bytes32 if needed
+        # For IPFS hashes (Qm...), we'll use keccak256 hash of the string
+        # In production, you'd want to properly decode the base58 IPFS hash
+        if isinstance(ipfs_hash_sim, str):
+            # Use web3 to hash the string to bytes32
+            from web3 import Web3
+            ipfs_hash_bytes32 = Web3.keccak(text=ipfs_hash_sim)
+        else:
+            ipfs_hash_bytes32 = ipfs_hash_sim
+        
+        # Default epsilon cost: 0.1 (scaled by 1e18)
+        if epsilon_cost is None:
+            epsilon_cost = int(0.1 * 1e18)  # 0.1 epsilon
+        else:
+            # Scale epsilon_cost to 1e18 if it's a float
+            if isinstance(epsilon_cost, float):
+                epsilon_cost = int(epsilon_cost * 1e18)
+        
+        # Use new submitHash function (matches specification)
+        try:
+            # Convert bytes32 back to string for submitHash (it accepts string)
+            # Or use registerUpdate with bytes32
+            # Try submitHash first (matches spec)
+            tx_hash = self.contract.functions.submitHash(
+                ipfs_hash_sim,  # String format
+                epsilon_cost
+            ).transact({
+                'from': client_account
+            })
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            self.total_gas_used += receipt.gasUsed
+            self.current_round_gas += receipt.gasUsed
+            return receipt.gasUsed
+        except Exception as e1:
+            # Fallback to registerUpdate (bytes32 version)
+            try:
+                tx_hash = self.contract.functions.registerUpdate(
+                    ipfs_hash_bytes32,
+                    epsilon_cost
+                ).transact({
+                    'from': client_account
+                })
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+                self.total_gas_used += receipt.gasUsed
+                self.current_round_gas += receipt.gasUsed
+                return receipt.gasUsed
+            except Exception as e2:
+                # Fallback to legacy function if new ones fail
+                print(f"   Warning: Using legacy submitUpdate")
+                tx_hash = self.contract.functions.submitUpdate(ipfs_hash_sim).transact({
+                    'from': client_account
+                })
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+                self.total_gas_used += receipt.gasUsed
+                self.current_round_gas += receipt.gasUsed
+                return receipt.gasUsed
 
+    def start_round(self, global_hash_sim):
+        """
+        Start a new round and emit event signaling availability of new global model CID.
+        This is called by the aggregator to signal clients that a new global model is available.
+        
+        Args:
+            global_hash_sim: IPFS hash (CID) of the new global model (string)
+        """
+        if isinstance(global_hash_sim, bytes):
+            # Convert bytes to string if needed
+            global_hash_sim = global_hash_sim.decode('utf-8') if isinstance(global_hash_sim, bytes) else str(global_hash_sim)
+        
+        try:
+            tx_hash = self.contract.functions.startRound(global_hash_sim).transact({
+                'from': self.aggregator
+            })
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            self.total_gas_used += receipt.gasUsed
+            self.current_round_gas += receipt.gasUsed
+            return receipt.gasUsed
+        except Exception as e:
+            print(f"   Warning: startRound failed, using verifyAndAggregate: {str(e)[:50]}")
+            return self.end_round(global_hash_sim)
+    
     def end_round(self, global_hash_sim):
-        """Aggregator publishes new global model hash"""
-        tx_hash = self.contract.functions.endRound(global_hash_sim).transact({
-            'from': self.aggregator
-        })
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
-        self.total_gas_used += receipt.gasUsed
-        self.current_round_gas += receipt.gasUsed
+        """
+        Aggregator verifies and publishes new global model hash.
+        Uses verifyAndAggregate() for new contract, falls back to endRound() for legacy.
+        """
+        # Convert string hash to bytes32 if needed
+        if isinstance(global_hash_sim, str):
+            from web3 import Web3
+            hash_bytes32 = Web3.keccak(text=global_hash_sim)
+        else:
+            hash_bytes32 = global_hash_sim
         
-        # Store gas for this round and reset
-        self.round_gas_used.append(self.current_round_gas)
-        round_gas = self.current_round_gas
-        self.current_round_gas = 0
+        # Use new verifyAndAggregate function
+        try:
+            tx_hash = self.contract.functions.verifyAndAggregate(hash_bytes32).transact({
+                'from': self.aggregator
+            })
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            self.total_gas_used += receipt.gasUsed
+            self.current_round_gas += receipt.gasUsed
+            
+            # Store gas for this round and reset
+            self.round_gas_used.append(self.current_round_gas)
+            round_gas = self.current_round_gas
+            self.current_round_gas = 0
+            
+            return round_gas
+        except Exception as e:
+            # Fallback to legacy function
+            print(f"   Warning: Using legacy endRound")
+            tx_hash = self.contract.functions.endRound(global_hash_sim).transact({
+                'from': self.aggregator
+            })
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            self.total_gas_used += receipt.gasUsed
+            self.current_round_gas += receipt.gasUsed
+            
+            # Store gas for this round and reset
+            self.round_gas_used.append(self.current_round_gas)
+            round_gas = self.current_round_gas
+            self.current_round_gas = 0
+            
+            return round_gas
+    
+    def get_client_status(self, client_index):
+        """
+        Get client status including reputation and consumed epsilon.
         
-        return round_gas
+        Args:
+            client_index: Index of the client
+            
+        Returns:
+            dict with registered, reputation, consumedEpsilon, lastRoundParticipated
+        """
+        client_account = self.accounts[(client_index + 1) % len(self.accounts)]
+        try:
+            status = self.contract.functions.getClientStatus(client_account).call()
+            return {
+                'registered': status[0],
+                'reputation': status[1],
+                'consumedEpsilon': status[2] / 1e18,  # Convert back from scaled
+                'lastRoundParticipated': status[3]
+            }
+        except Exception as e:
+            return None
+    
+    def get_global_model_hash(self):
+        """Get the current global model hash from the contract"""
+        try:
+            return self.contract.functions.globalModelHash().call()
+        except Exception as e:
+            return None
 
     def get_cost_analysis(self):
         # Ganache usually defaults to 20 Gwei, but we can query it

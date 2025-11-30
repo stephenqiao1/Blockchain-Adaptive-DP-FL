@@ -305,10 +305,61 @@ def test_privacy_spent(controller):
         print(f"✗ Privacy spent test failed: {e}")
         raise
 
+def test_adaptive_clipping(controller):
+    """Test adaptive clipping based on gradient norms"""
+    print("\n" + "=" * 60)
+    print("Test 9: Adaptive Clipping (Gradient Norm Quantiles)")
+    print("=" * 60)
+    try:
+        # Reset controller
+        controller.prev_loss = float('inf')
+        controller.noise_multiplier = 1.0
+        controller.max_grad_norm = 1.0
+        controller.gradient_norms = []
+        
+        # Create a mock model with gradients
+        model = create_mock_model()
+        
+        # Simulate different gradient norm scenarios
+        # Scenario 1: Small gradients
+        for _ in range(10):
+            for param in model.parameters():
+                param.grad = torch.randn_like(param) * 0.1  # Small gradients
+            controller.collect_gradient_norm(model)
+        
+        # Adapt clipping threshold
+        initial_clip = controller.max_grad_norm
+        controller.adapt_clipping_threshold()
+        clip_after_small = controller.max_grad_norm
+        
+        # Scenario 2: Large gradients
+        controller.gradient_norms = []
+        for _ in range(10):
+            for param in model.parameters():
+                param.grad = torch.randn_like(param) * 2.0  # Large gradients
+            controller.collect_gradient_norm(model)
+        
+        controller.adapt_clipping_threshold()
+        clip_after_large = controller.max_grad_norm
+        
+        # Verify clipping adapts to gradient norms
+        assert clip_after_large > clip_after_small, "Clipping should increase for larger gradients"
+        assert clip_after_large >= controller.min_clip_norm, "Clip should be >= minimum"
+        assert clip_after_large <= controller.max_clip_norm, "Clip should be <= maximum"
+        
+        print("✓ Adaptive clipping test passed")
+        print(f"  - Initial clip: {initial_clip:.4f}")
+        print(f"  - After small gradients: {clip_after_small:.4f}")
+        print(f"  - After large gradients: {clip_after_large:.4f}")
+        print(f"  - Clipping adapts to gradient distribution: ✓")
+    except Exception as e:
+        print(f"✗ Adaptive clipping test failed: {e}")
+        raise
+
 def test_realistic_training_sequence(controller):
     """Test a realistic training sequence with mixed loss patterns"""
     print("\n" + "=" * 60)
-    print("Test 9: Realistic Training Sequence")
+    print("Test 10: Realistic Training Sequence")
     print("=" * 60)
     try:
         # Reset controller
@@ -316,12 +367,23 @@ def test_realistic_training_sequence(controller):
         controller.noise_multiplier = 1.0
         controller.max_grad_norm = 1.0
         controller.patience_counter = 0
+        controller.gradient_norms = []
         
         # Simulate realistic training: initial high loss, then decreasing, then plateau
         losses = [2.0, 1.5, 1.2, 1.0, 0.9, 0.85, 0.9, 0.88, 0.87, 0.86]
         
+        # Simulate gradient norms (larger early, smaller later)
+        model = create_mock_model()
+        gradient_scales = [2.0, 1.5, 1.2, 1.0, 0.8, 0.7, 0.8, 0.75, 0.7, 0.65]
+        
         print("  Simulating training sequence:")
-        for i, loss in enumerate(losses):
+        for i, (loss, grad_scale) in enumerate(zip(losses, gradient_scales)):
+            # Simulate gradient collection
+            for _ in range(5):  # Collect a few gradient norms
+                for param in model.parameters():
+                    param.grad = torch.randn_like(param) * grad_scale
+                controller.collect_gradient_norm(model)
+            
             noise, clip = controller.adapt_parameters(loss)
             trend = "↓" if i > 0 and loss < losses[i-1] else "↑" if i > 0 and loss > losses[i-1] else "="
             print(f"    Step {i+1}: Loss={loss:.2f} {trend} -> Noise={noise:.4f}, Clip={clip:.4f}")
@@ -369,7 +431,10 @@ def main():
         # Test 8: Privacy spent
         test_privacy_spent(controller_adaptive)
         
-        # Test 9: Realistic training sequence
+        # Test 9: Adaptive clipping
+        test_adaptive_clipping(controller_adaptive)
+        
+        # Test 10: Realistic training sequence
         test_realistic_training_sequence(controller_adaptive)
         
         print("\n" + "=" * 60)
